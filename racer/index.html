@@ -1,0 +1,827 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NEON DRIFT - Procedural Retro Racer</title>
+    <style>
+        body {
+            margin: 0;
+            background: #111;
+            overflow: hidden;
+            font-family: 'Courier New', Courier, monospace;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            color: white;
+        }
+        canvas {
+            background: #000;
+            box-shadow: 0 0 20px rgba(0,0,0,0.8);
+            image-rendering: pixelated;
+        }
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            font-size: 20px;
+            text-shadow: 2px 2px 0 #000;
+            z-index: 10;
+            pointer-events: none;
+        }
+        .scanlines {
+            position: absolute;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: linear-gradient(
+                to bottom,
+                rgba(255,255,255,0),
+                rgba(255,255,255,0) 50%,
+                rgba(0,0,0,0.15) 50%,
+                rgba(0,0,0,0.15)
+            );
+            background-size: 100% 4px;
+            pointer-events: none;
+            z-index: 20;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui"></div>
+    <div class="scanlines"></div>
+    <canvas id="gameCanvas"></canvas>
+
+<script>
+/**
+ * NEON DRIFT - RETRO RACER
+ * 
+ * Fixed implementation based on Jake Gordon's javascript-racer approach.
+ * Key concepts:
+ * - Proper 3D projection: scale = cameraDepth / z
+ * - Curves are "faked" by accumulating x-offset per segment
+ * - Hills use real y-coordinate projection
+ */
+
+// --- CONFIGURATION ---
+const WIDTH = 640;
+const HEIGHT = 480;
+const FPS = 60;
+const STEP = 1/FPS;
+
+// Road parameters
+const ROAD_WIDTH = 2000;          // Half the road width (road spans -ROAD_WIDTH to +ROAD_WIDTH)
+const SEGMENT_LENGTH = 200;       // Length of each road segment
+const RUMBLE_LENGTH = 3;          // Segments per rumble strip color
+const DRAW_DISTANCE = 150;        // How many segments to render
+const LANES = 3;
+
+// Camera parameters
+const FIELD_OF_VIEW = 100;        // Degrees
+const CAMERA_HEIGHT = 1000;       // Height above road
+const CAMERA_DEPTH = 1 / Math.tan((FIELD_OF_VIEW / 2) * Math.PI / 180);
+
+// Gameplay
+const CENTRIFUGAL = 0.3;          // How much curves push the player
+
+// --- GLOBALS ---
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+canvas.width = WIDTH;
+canvas.height = HEIGHT;
+
+let keyState = { ArrowLeft: false, ArrowRight: false, ArrowUp: false, ArrowDown: false, Enter: false };
+
+// --- ASSET GENERATOR (PROCEDURAL) ---
+const Sprites = {};
+
+function createOffscreenCanvas(w, h, drawFn) {
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    const cx = c.getContext('2d');
+    drawFn(cx, w, h);
+    return c;
+}
+
+function generateAssets() {
+    // CAR (3 angles: Left, Straight, Right)
+    const drawCar = (ctx, w, h, turn) => {
+        // Shadow
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.beginPath();
+        ctx.ellipse(w/2, h-10, w/2.2, 10, 0, 0, Math.PI*2);
+        ctx.fill();
+
+        const bodyColor = '#d9002f';
+        const darkBody = '#8c001e';
+        
+        ctx.save();
+        let skew = 0;
+        if(turn === -1) skew = -0.1;
+        if(turn === 1) skew = 0.1;
+        ctx.transform(1, 0, skew, 1, 0, 0);
+
+        // Main Chassis
+        ctx.fillStyle = bodyColor;
+        ctx.fillRect(w*0.15, h*0.5, w*0.7, h*0.35);
+        
+        // Top/Cabin
+        ctx.fillStyle = darkBody;
+        ctx.fillRect(w*0.25, h*0.3, w*0.5, h*0.25);
+        
+        // Rear Window
+        ctx.fillStyle = '#87CEEB';
+        ctx.fillRect(w*0.3, h*0.32, w*0.4, h*0.15);
+
+        // Bumpers
+        ctx.fillStyle = '#333';
+        ctx.fillRect(w*0.15, h*0.78, w*0.7, h*0.1);
+
+        // Turn signals
+        ctx.fillStyle = '#ffcc00';
+        ctx.globalAlpha = (turn === -1) ? 1 : 0.4;
+        ctx.fillRect(w*0.15, h*0.65, w*0.1, h*0.1);
+        ctx.globalAlpha = (turn === 1) ? 1 : 0.4;
+        ctx.fillRect(w*0.75, h*0.65, w*0.1, h*0.1);
+        ctx.globalAlpha = 1;
+
+        // Tail lights
+        ctx.fillStyle = '#ff0000';
+        ctx.fillRect(w*0.2, h*0.55, w*0.15, h*0.1);
+        ctx.fillRect(w*0.65, h*0.55, w*0.15, h*0.1);
+
+        // Tires
+        ctx.fillStyle = '#111';
+        ctx.fillRect(w*0.1, h*0.7, w*0.12, h*0.2);
+        ctx.fillRect(w*0.78, h*0.7, w*0.12, h*0.2);
+
+        ctx.restore();
+    };
+
+    Sprites.carStraight = createOffscreenCanvas(80, 60, (c,w,h) => drawCar(c,w,h,0));
+    Sprites.carLeft = createOffscreenCanvas(80, 60, (c,w,h) => drawCar(c,w,h,-1));
+    Sprites.carRight = createOffscreenCanvas(80, 60, (c,w,h) => drawCar(c,w,h,1));
+
+    // TREE
+    Sprites.tree = createOffscreenCanvas(200, 300, (ctx, w, h) => {
+        ctx.fillStyle = '#5d4037';
+        ctx.fillRect(w*0.4, h*0.8, w*0.2, h*0.2);
+        
+        ctx.fillStyle = '#1b5e20';
+        const drawLayer = (y, width) => {
+            ctx.beginPath();
+            ctx.moveTo(w/2, y);
+            ctx.lineTo(w/2 - width, y + h*0.25);
+            ctx.lineTo(w/2 + width, y + h*0.25);
+            ctx.fill();
+        };
+        drawLayer(h*0.05, w*0.3);
+        drawLayer(h*0.25, w*0.4);
+        drawLayer(h*0.5, w*0.45);
+
+        ctx.fillStyle = '#4caf50';
+        ctx.beginPath();
+        ctx.moveTo(w/2, h*0.05);
+        ctx.lineTo(w/2 - w*0.1, h*0.2);
+        ctx.lineTo(w/2, h*0.25);
+        ctx.fill();
+    });
+
+    // ROCK - larger and more visible
+    Sprites.rock = createOffscreenCanvas(120, 100, (ctx, w, h) => {
+        // Main rock body - brighter color
+        ctx.fillStyle = '#888';
+        ctx.beginPath();
+        ctx.moveTo(w*0.15, h);
+        ctx.lineTo(w*0.05, h*0.5);
+        ctx.lineTo(w*0.25, h*0.2);
+        ctx.lineTo(w*0.55, h*0.1);
+        ctx.lineTo(w*0.85, h*0.3);
+        ctx.lineTo(w*0.95, h*0.6);
+        ctx.lineTo(w*0.85, h);
+        ctx.closePath();
+        ctx.fill();
+        
+        // Highlight
+        ctx.fillStyle = '#aaa';
+        ctx.beginPath();
+        ctx.moveTo(w*0.25, h*0.2);
+        ctx.lineTo(w*0.55, h*0.1);
+        ctx.lineTo(w*0.5, h*0.35);
+        ctx.lineTo(w*0.3, h*0.4);
+        ctx.closePath();
+        ctx.fill();
+        
+        // Dark shadow
+        ctx.fillStyle = '#555';
+        ctx.beginPath();
+        ctx.moveTo(w*0.55, h*0.5);
+        ctx.lineTo(w*0.85, h*0.6);
+        ctx.lineTo(w*0.75, h*0.85);
+        ctx.lineTo(w*0.5, h*0.7);
+        ctx.closePath();
+        ctx.fill();
+    });
+
+    // BACKGROUND
+    Sprites.background = createOffscreenCanvas(WIDTH, HEIGHT/2, (ctx, w, h) => {
+        const grad = ctx.createLinearGradient(0, 0, 0, h);
+        grad.addColorStop(0, '#0d47a1');
+        grad.addColorStop(1, '#8e24aa');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0,0,w,h);
+
+        ctx.fillStyle = '#ffeb3b';
+        ctx.beginPath();
+        ctx.arc(w*0.8, h*0.3, 40, 0, Math.PI*2);
+        ctx.fill();
+
+        ctx.fillStyle = '#1a237e';
+        ctx.beginPath();
+        ctx.moveTo(0, h);
+        for(let i=0; i<=w; i+=20) {
+            ctx.lineTo(i, h - Math.random()*50 - 20);
+        }
+        ctx.lineTo(w, h);
+        ctx.fill();
+    });
+}
+
+// --- AUDIO SYSTEM ---
+const Audio = {
+    ctx: null,
+    engineOsc: null,
+    lfoOsc: null,
+    gainNode: null,
+    
+    init: function() {
+        if (this.ctx) return;
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        this.ctx = new AudioContext();
+        
+        this.engineOsc = this.ctx.createOscillator();
+        this.engineOsc.type = 'sawtooth';
+        this.engineOsc.frequency.value = 60;
+
+        this.lfoOsc = this.ctx.createOscillator();
+        this.lfoOsc.type = 'square';
+        this.lfoOsc.frequency.value = 30;
+
+        const lfoGain = this.ctx.createGain();
+        lfoGain.gain.value = 50;
+
+        this.gainNode = this.ctx.createGain();
+        this.gainNode.gain.value = 0.08;
+
+        this.lfoOsc.connect(lfoGain);
+        lfoGain.connect(this.engineOsc.frequency);
+        
+        this.engineOsc.connect(this.gainNode);
+        this.gainNode.connect(this.ctx.destination);
+
+        this.engineOsc.start();
+        this.lfoOsc.start();
+    },
+
+    updateEngine: function(speedPercent) {
+        if (!this.ctx) return;
+        const baseFreq = 60;
+        const topFreq = 200;
+        const currentFreq = baseFreq + (topFreq - baseFreq) * speedPercent;
+        this.engineOsc.frequency.setTargetAtTime(currentFreq, this.ctx.currentTime, 0.1);
+        this.lfoOsc.frequency.setTargetAtTime(20 + speedPercent * 20, this.ctx.currentTime, 0.1);
+    },
+
+    playCrash: function() {
+        if (!this.ctx) return;
+        const osc = this.ctx.createOscillator();
+        const gain = this.ctx.createGain();
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(100, this.ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(10, this.ctx.currentTime + 0.5);
+        gain.gain.setValueAtTime(0.5, this.ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, this.ctx.currentTime + 0.5);
+        osc.connect(gain);
+        gain.connect(this.ctx.destination);
+        osc.start();
+        osc.stop(this.ctx.currentTime + 0.5);
+    }
+};
+
+// --- UTILITY FUNCTIONS ---
+const Util = {
+    // Increase a value, wrapping at max
+    increase: function(start, increment, max) {
+        let result = start + increment;
+        while (result >= max) result -= max;
+        while (result < 0) result += max;
+        return result;
+    },
+    
+    // Accelerate with dt
+    accelerate: function(v, accel, dt) {
+        return v + (accel * dt);
+    },
+    
+    // Clamp value between min and max
+    limit: function(value, min, max) {
+        return Math.max(min, Math.min(value, max));
+    },
+    
+    // Get percentage remaining within a segment
+    percentRemaining: function(n, total) {
+        return (n % total) / total;
+    },
+    
+    // Easing functions for smooth curve transitions
+    easeIn: function(a, b, percent) {
+        return a + (b - a) * Math.pow(percent, 2);
+    },
+    easeOut: function(a, b, percent) {
+        return a + (b - a) * (1 - Math.pow(1 - percent, 2));
+    },
+    easeInOut: function(a, b, percent) {
+        return a + (b - a) * ((-Math.cos(percent * Math.PI) / 2) + 0.5);
+    }
+};
+
+// --- GAME LOGIC ---
+const Game = {
+    segments: [],
+    trackLength: 0,
+    
+    // Player state
+    position: 0,          // Z position (camera position)
+    playerX: 0,           // X position (-1 to 1, normalized)
+    speed: 0,
+    
+    // Speed parameters
+    maxSpeed: SEGMENT_LENGTH / STEP,   // Max speed = 1 segment per frame
+    accel: null,
+    breaking: null,
+    decel: null,
+    offRoadDecel: null,
+    offRoadLimit: null,
+    
+    // Player Z offset from camera
+    playerZ: null,
+    
+    // Game state
+    state: 'title',
+    score: 0,
+    distanceRun: 0,
+    
+    init: function() {
+        // Set speed parameters based on maxSpeed
+        this.accel = this.maxSpeed / 5;
+        this.breaking = -this.maxSpeed;
+        this.decel = -this.maxSpeed / 5;
+        this.offRoadDecel = -this.maxSpeed / 2;
+        this.offRoadLimit = this.maxSpeed / 4;
+        this.playerZ = CAMERA_HEIGHT * CAMERA_DEPTH;  // Where player appears on screen
+    },
+    
+    // Find segment at given Z position
+    findSegment: function(z) {
+        return this.segments[Math.floor(z / SEGMENT_LENGTH) % this.segments.length];
+    },
+    
+    // Get last Y value for road building
+    lastY: function() {
+        return (this.segments.length === 0) ? 0 : this.segments[this.segments.length - 1].p2.world.y;
+    },
+    
+    // Add a single road segment
+    addSegment: function(curve, y) {
+        const n = this.segments.length;
+        this.segments.push({
+            index: n,
+            p1: { world: { y: this.lastY(), z: n * SEGMENT_LENGTH }, camera: {}, screen: {} },
+            p2: { world: { y: y, z: (n + 1) * SEGMENT_LENGTH }, camera: {}, screen: {} },
+            curve: curve,
+            sprites: [],
+            color: Math.floor(n / RUMBLE_LENGTH) % 2 ? 'dark' : 'light'
+        });
+    },
+    
+    // Add a road section with easing into/out of curves and hills
+    addRoad: function(enter, hold, leave, curve, y) {
+        const startY = this.lastY();
+        const endY = startY + (y || 0) * SEGMENT_LENGTH;
+        const total = enter + hold + leave;
+        
+        for (let n = 0; n < enter; n++) {
+            this.addSegment(Util.easeIn(0, curve, n / enter), Util.easeInOut(startY, endY, n / total));
+        }
+        for (let n = 0; n < hold; n++) {
+            this.addSegment(curve, Util.easeInOut(startY, endY, (enter + n) / total));
+        }
+        for (let n = 0; n < leave; n++) {
+            this.addSegment(Util.easeInOut(curve, 0, n / leave), Util.easeInOut(startY, endY, (enter + hold + n) / total));
+        }
+    },
+    
+    // Convenience road builders
+    addStraight: function(num) {
+        this.addRoad(num, num, num, 0, 0);
+    },
+    addCurve: function(num, curve, hill) {
+        this.addRoad(num, num, num, curve, hill);
+    },
+    addSCurves: function() {
+        this.addRoad(25, 50, 25, -2, 0);
+        this.addRoad(25, 50, 25,  4, 0);
+        this.addRoad(25, 50, 25,  2, 0);
+        this.addRoad(25, 50, 25, -4, 0);
+    },
+    addHill: function(num, height) {
+        this.addRoad(num, num, num, 0, height);
+    },
+    
+    buildRoad: function() {
+        this.segments = [];
+        
+        // Build track
+        this.addStraight(25);
+        this.addHill(25, 20);
+        this.addCurve(50, 2, 0);        // Easy right
+        this.addStraight(25);
+        this.addCurve(50, -4, 10);      // Medium left + hill
+        this.addHill(25, -20);          // Downhill
+        this.addCurve(75, 3, 0);        // Right curve
+        this.addSCurves();
+        this.addStraight(50);
+        this.addCurve(50, -2, 0);       // Easy left
+        this.addHill(50, 30);           // Big hill
+        this.addCurve(50, 4, -30);      // Hard right, downhill
+        this.addStraight(100);
+        
+        this.trackLength = this.segments.length * SEGMENT_LENGTH;
+        
+        // Add sprites to segments
+        for (let n = 25; n < this.segments.length - 25; n++) {
+            // Trees on sides - fairly common
+            if (Math.random() < 0.2) {
+                const offset = 1.3 + Math.random() * 2.5;
+                const side = Math.random() > 0.5 ? 1 : -1;
+                this.segments[n].sprites.push({ 
+                    source: Sprites.tree, 
+                    offset: side * offset 
+                });
+            }
+            // Rocks on road (obstacles) - much rarer, and not too close to center
+            if (Math.random() < 0.008) {
+                // Place rocks in lanes but not dead center
+                const laneOffset = (Math.random() > 0.5 ? 1 : -1) * (0.3 + Math.random() * 0.4);
+                this.segments[n].sprites.push({ 
+                    source: Sprites.rock, 
+                    offset: laneOffset,
+                    collide: true
+                });
+            }
+        }
+    },
+    
+    reset: function() {
+        this.position = 0;
+        this.playerX = 0;
+        this.speed = 0;
+        this.score = 0;
+        this.distanceRun = 0;
+        this.buildRoad();
+    },
+    
+    update: function(dt) {
+        if (this.state !== 'play') return;
+        
+        const playerSegment = this.findSegment(this.position + this.playerZ);
+        const speedPercent = this.speed / this.maxSpeed;
+        const dx = dt * 2 * speedPercent;  // Steering speed
+        
+        // Update position based on speed
+        this.position = Util.increase(this.position, dt * this.speed, this.trackLength);
+        this.distanceRun += dt * this.speed;
+        
+        // Steering
+        if (keyState.ArrowLeft) this.playerX -= dx;
+        if (keyState.ArrowRight) this.playerX += dx;
+        
+        // Centrifugal force - curves push you outward
+        this.playerX -= dx * speedPercent * playerSegment.curve * CENTRIFUGAL;
+        
+        // Acceleration/braking
+        if (keyState.ArrowUp) {
+            this.speed = Util.accelerate(this.speed, this.accel, dt);
+        } else if (keyState.ArrowDown) {
+            this.speed = Util.accelerate(this.speed, this.breaking, dt);
+        } else {
+            this.speed = Util.accelerate(this.speed, this.decel, dt);
+        }
+        
+        // Off-road slowdown
+        if ((this.playerX < -1 || this.playerX > 1) && this.speed > this.offRoadLimit) {
+            this.speed = Util.accelerate(this.speed, this.offRoadDecel, dt);
+        }
+        
+        // Clamp values
+        this.playerX = Util.limit(this.playerX, -2, 2);
+        this.speed = Util.limit(this.speed, 0, this.maxSpeed);
+        
+        // Collision with rocks - only when we're actually close to them
+        // playerZ is how far ahead of camera the player is
+        const playerAbsoluteZ = this.position + this.playerZ;
+        const segmentStart = Math.floor(playerAbsoluteZ / SEGMENT_LENGTH) * SEGMENT_LENGTH;
+        const progressInSegment = (playerAbsoluteZ - segmentStart) / SEGMENT_LENGTH;
+        
+        // Only check collision when we're in the middle portion of segment (where rocks appear)
+        if (progressInSegment > 0.3 && progressInSegment < 0.7) {
+            for (const sprite of playerSegment.sprites) {
+                if (sprite.collide) {
+                    const spriteW = 0.25;  // Hit box width
+                    if (this.playerX > sprite.offset - spriteW && this.playerX < sprite.offset + spriteW) {
+                        if (this.speed > this.maxSpeed * 0.05) {
+                            this.speed = this.maxSpeed * 0.1;  // Slow down instead of full stop
+                            Audio.playCrash();
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Track loop bonus
+        if (this.position < dt * this.speed) {
+            this.score += 1000;
+        }
+        
+        // Audio
+        Audio.updateEngine(this.speed / this.maxSpeed);
+    },
+    
+    // PROJECT: Transform world coordinates to screen coordinates
+    project: function(p, cameraX, cameraY, cameraZ) {
+        // Translate relative to camera
+        p.camera.x = (p.world.x || 0) - cameraX;
+        p.camera.y = (p.world.y || 0) - cameraY;
+        p.camera.z = (p.world.z || 0) - cameraZ;
+        
+        // Project to screen using similar triangles: screen = camera * (d / z)
+        p.screen.scale = CAMERA_DEPTH / p.camera.z;
+        p.screen.x = Math.round((WIDTH / 2) + (p.screen.scale * p.camera.x * WIDTH / 2));
+        p.screen.y = Math.round((HEIGHT / 2) - (p.screen.scale * p.camera.y * HEIGHT / 2));
+        p.screen.w = Math.round(p.screen.scale * ROAD_WIDTH * WIDTH / 2);
+    },
+    
+    render: function() {
+        ctx.clearRect(0, 0, WIDTH, HEIGHT);
+        
+        if (this.state === 'title') {
+            this.renderTitle();
+            return;
+        }
+        
+        // Draw background
+        ctx.drawImage(Sprites.background, 0, 0);
+        
+        // Find base segment and offset within it
+        const baseSegment = this.findSegment(this.position);
+        const basePercent = Util.percentRemaining(this.position, SEGMENT_LENGTH);
+        
+        // Get player segment for current curve
+        const playerSegment = this.findSegment(this.position + this.playerZ);
+        const playerY = playerSegment.p1.world.y + 
+            (playerSegment.p2.world.y - playerSegment.p1.world.y) * 
+            Util.percentRemaining(this.position + this.playerZ, SEGMENT_LENGTH);
+        
+        let maxy = HEIGHT;
+        
+        // Curve offset accumulation (the key to fake curves!)
+        // dx starts as an interpolated value based on how far through current segment we are
+        let x = 0;
+        let dx = -(baseSegment.curve * basePercent);
+        
+        // Render road segments front-to-back
+        for (let n = 0; n < DRAW_DISTANCE; n++) {
+            const segmentIndex = (baseSegment.index + n) % this.segments.length;
+            const segment = this.segments[segmentIndex];
+            const looped = segment.index < baseSegment.index;
+            
+            // Handle track looping
+            const camZ = this.position - (looped ? this.trackLength : 0);
+            
+            // Project both points of this segment
+            // Key: we subtract x (accumulated curve offset) from cameraX
+            this.project(segment.p1, (this.playerX * ROAD_WIDTH) - x, CAMERA_HEIGHT + playerY, camZ);
+            this.project(segment.p2, (this.playerX * ROAD_WIDTH) - x - dx, CAMERA_HEIGHT + playerY, camZ);
+            
+            // Accumulate curve offset for next segment
+            x += dx;
+            dx += segment.curve;
+            
+            // Culling
+            if (segment.p1.camera.z <= CAMERA_DEPTH) continue;  // Behind camera
+            if (segment.p2.screen.y >= segment.p1.screen.y) continue;  // Behind horizon
+            if (segment.p2.screen.y >= maxy) continue;  // Below already-rendered segments
+            
+            this.renderSegment(segment);
+            maxy = segment.p1.screen.y;
+        }
+        
+        // Render sprites back-to-front (painter's algorithm)
+        for (let n = DRAW_DISTANCE - 1; n > 0; n--) {
+            const segmentIndex = (baseSegment.index + n) % this.segments.length;
+            const segment = this.segments[segmentIndex];
+            
+            for (const sprite of segment.sprites) {
+                this.renderSprite(segment, sprite);
+            }
+        }
+        
+        // Render player car
+        this.renderPlayer();
+        
+        // UI
+        this.renderUI();
+    },
+    
+    renderSegment: function(segment) {
+        const x1 = segment.p1.screen.x;
+        const y1 = segment.p1.screen.y;
+        const w1 = segment.p1.screen.w;
+        const x2 = segment.p2.screen.x;
+        const y2 = segment.p2.screen.y;
+        const w2 = segment.p2.screen.w;
+        
+        // Calculate rumble strip width
+        const r1 = w1 / 8;
+        const r2 = w2 / 8;
+        
+        // Choose colors based on segment color
+        const grass = segment.color === 'dark' ? '#006400' : '#008000';
+        const rumble = segment.color === 'dark' ? '#cc0000' : '#ffffff';
+        const road = segment.color === 'dark' ? '#555555' : '#666666';
+        const lane = segment.color === 'dark' ? '#ffffff' : null;
+        
+        // Draw grass
+        ctx.fillStyle = grass;
+        ctx.fillRect(0, y2, WIDTH, y1 - y2);
+        
+        // Draw rumble strips
+        this.drawPoly(x1 - w1 - r1, y1, x1 - w1, y1, x2 - w2, y2, x2 - w2 - r2, y2, rumble);
+        this.drawPoly(x1 + w1 + r1, y1, x1 + w1, y1, x2 + w2, y2, x2 + w2 + r2, y2, rumble);
+        
+        // Draw road
+        this.drawPoly(x1 - w1, y1, x1 + w1, y1, x2 + w2, y2, x2 - w2, y2, road);
+        
+        // Draw lane markers
+        if (lane) {
+            const laneW1 = w1 / 40;
+            const laneW2 = w2 / 40;
+            // Left lane line
+            const ll1 = -w1 / 3;
+            const ll2 = -w2 / 3;
+            this.drawPoly(x1 + ll1 - laneW1, y1, x1 + ll1 + laneW1, y1, 
+                          x2 + ll2 + laneW2, y2, x2 + ll2 - laneW2, y2, lane);
+            // Right lane line
+            const rl1 = w1 / 3;
+            const rl2 = w2 / 3;
+            this.drawPoly(x1 + rl1 - laneW1, y1, x1 + rl1 + laneW1, y1, 
+                          x2 + rl2 + laneW2, y2, x2 + rl2 - laneW2, y2, lane);
+        }
+    },
+    
+    drawPoly: function(x1, y1, x2, y2, x3, y3, x4, y4, color) {
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.lineTo(x3, y3);
+        ctx.lineTo(x4, y4);
+        ctx.closePath();
+        ctx.fill();
+    },
+    
+    renderSprite: function(segment, sprite) {
+        const scale = segment.p1.screen.scale;
+        const roadWidth = segment.p1.screen.w;
+        
+        // Calculate sprite position relative to road center
+        const x = segment.p1.screen.x + (sprite.offset * roadWidth);
+        const y = segment.p1.screen.y;
+        
+        if (scale <= 0 || y <= 0) return;
+        
+        // Scale sprites based on road width for consistent sizing
+        const spriteScale = roadWidth / 300;  // Normalized to look good
+        const destW = sprite.source.width * spriteScale;
+        const destH = sprite.source.height * spriteScale;
+        
+        // Don't draw if too small
+        if (destW < 2 || destH < 2) return;
+        
+        // Draw sprite with bottom at road level
+        const destY = y - destH;
+        
+        ctx.drawImage(sprite.source, x - destW / 2, destY, destW, destH);
+    },
+    
+    renderPlayer: function() {
+        const speedPercent = this.speed / this.maxSpeed;
+        const bounce = speedPercent * (Math.random() * 3);
+        
+        // Use a FIXED scale for the player car, not projection-based
+        // This makes the car a reasonable size at the bottom of the screen
+        const carScale = 3.5;  // Fixed multiplier for car size
+        
+        let carImg = Sprites.carStraight;
+        if (keyState.ArrowLeft) carImg = Sprites.carLeft;
+        else if (keyState.ArrowRight) carImg = Sprites.carRight;
+        
+        const destW = carImg.width * carScale;
+        const destH = carImg.height * carScale;
+        
+        // Draw car at bottom center of screen
+        ctx.drawImage(carImg, 
+            WIDTH / 2 - destW / 2, 
+            HEIGHT - destH - 10 + bounce, 
+            destW, destH);
+    },
+    
+    renderUI: function() {
+        const ui = document.getElementById('ui');
+        const kmh = Math.round(this.speed / this.maxSpeed * 300);
+        const dist = (this.distanceRun / 1000).toFixed(1);
+        ui.innerHTML = `SPEED: ${kmh} km/h<br>DIST: ${dist} km<br>SCORE: ${this.score}`;
+    },
+    
+    renderTitle: function() {
+        const grad = ctx.createLinearGradient(0, 0, 0, HEIGHT);
+        grad.addColorStop(0, '#111');
+        grad.addColorStop(1, '#440022');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, WIDTH, HEIGHT);
+        
+        ctx.fillStyle = '#ff00ff';
+        ctx.font = 'bold 60px "Courier New"';
+        ctx.textAlign = 'center';
+        ctx.shadowColor = '#00ffff';
+        ctx.shadowOffsetX = 4;
+        ctx.shadowOffsetY = 4;
+        ctx.shadowBlur = 0;
+        ctx.fillText("NEON DRIFT", WIDTH / 2, HEIGHT / 2 - 50);
+		ctx.fillText("by B34STW4RS", WIDTH / 2, HEIGHT / 2 + 25);
+        
+        ctx.shadowColor = 'transparent';
+        ctx.fillStyle = 'white';
+        ctx.font = '20px "Courier New"';
+        
+        if (Math.floor(Date.now() / 500) % 2 === 0) {
+            ctx.fillText("PRESS ENTER TO START", WIDTH / 2, HEIGHT / 2 + 50);
+        }
+        
+        ctx.font = '16px "Courier New"';
+        ctx.fillStyle = '#aaa';
+        ctx.fillText("ARROWS to Drive", WIDTH / 2, HEIGHT / 2 + 90);
+    }
+};
+
+// --- INPUT HANDLERS ---
+document.addEventListener('keydown', e => {
+    if (keyState.hasOwnProperty(e.code)) {
+        keyState[e.code] = true;
+        e.preventDefault();
+    }
+    if (e.code === 'Enter' && Game.state === 'title') {
+        Audio.init();
+        Game.reset();
+        Game.state = 'play';
+    }
+});
+
+document.addEventListener('keyup', e => {
+    if (keyState.hasOwnProperty(e.code)) {
+        keyState[e.code] = false;
+    }
+});
+
+// --- MAIN LOOP ---
+generateAssets();
+Game.init();
+
+let lastTime = 0;
+function loop(time) {
+    const dt = Math.min(1, (time - lastTime) / 1000);
+    lastTime = time;
+    
+    if (Game.state === 'play') {
+        Game.update(STEP);  // Fixed time step for consistency
+    }
+    Game.render();
+    
+    requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
